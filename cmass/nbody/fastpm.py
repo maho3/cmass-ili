@@ -209,14 +209,14 @@ def process_single_snapshot(cfg, outdir, a, delete_files=True):
     # Convert from physical -> comoving velocities
     fvel *= 1/a
 
-    if delete_files:
-        infile.close()
-        shutil.rmtree(snapdir)
-
     # Save to file
     with h5py.File(join(outdir, f'nbody_{a:.4f}.h5'), 'w') as outfile:
         outfile.create_dataset('rho', data=rho)
         outfile.create_dataset('fvel', data=fvel)
+
+    if delete_files:
+        infile.close()
+        shutil.rmtree(snapdir)
 
 
 @timing_decorator
@@ -297,7 +297,8 @@ def main(cfg: DictConfig) -> None:
     logging.info("Processing outputs...")
     if cfg.nbody.save_transfer:
         process_transfer(cfg, outdir, delete_files=True)
-    rho, fvel, pos, vel = process_outputs(cfg, outdir, delete_files=True)
+    if cfg.nbody.postprocess:
+        rho, fvel, pos, vel = process_outputs(cfg, outdir, delete_files=True)
 
     if not cfg.nbody.save_particles:
         pos, vel = None, None

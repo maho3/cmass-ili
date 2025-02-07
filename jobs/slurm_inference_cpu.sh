@@ -15,13 +15,13 @@ if [[ -z "$PS1" ]]; then
 fi
 
 module restore cmass
-conda activate cmass
+conda activate cmassrun
 
 # exp_index=null
 net_index=$SLURM_ARRAY_TASK_ID
 
 # Command to run for each lhid
-cd /home/x-mho1/git/ltu-cmass
+cd /home/x-mho1/git/ltu-cmass-run
 
 nbody=mtnglike
 sim=fastpm

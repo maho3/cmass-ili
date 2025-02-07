@@ -1,0 +1,38 @@
+# for calibrating halo biasing models with quijote
+suite: for_sammy
+
+# General parameters
+L: 1000           # Mpc/h
+N: 128            # meshgrid resolution
+lhid: 0           # latin hypercube id
+matchIC: 0        # whether to match ICs to file (0 no, 1 yes, 2 quijote)
+supersampling: 3  # particles resolution relative to meshgrid
+save_particles: false  # whether to save particle data
+save_transfer: True    # whether to save z=99 ICs (for CHARM bias model)
+
+zi: 10            # initial redshift (for grav solver)
+zf: 0.0           # final redshift
+
+# snapshot scale factors to save (e.g. evenly spaced in a)
+asave:
+  - 0.4
+  - 0.6
+  - 0.666667
+  - 1.0
+
+
+# borglpt, borgpm and pinocchio-only
+transfer: 'CAMB' # transfer function (EH, CLASS, CAMB or SYREN. Only EH or CLASS for borg)
+
+# borglpt-only
+order: 2          # order of the LPT expansion
+
+# pmwd, fastpm, borgpm-only
+B: 2              # force grid resolution relative to particle grid
+N_steps: 32       # number of PM integration steps
+
+# borgpm-only
+COLA: true        # whether to use COLA
+
+# pinocchio only
+mass_function: Watson_2013  # which output HMF to use

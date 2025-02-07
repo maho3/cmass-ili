@@ -1,0 +1,38 @@
+
+save_dir: null  # where to save trained models (default e.g. wdir/quijotelike/fastpm/models)
+
+halo: False      # whether to train on halo summaries
+galaxy: False    # whether to train on galaxy summaries
+ngc_lightcone: False # whether to train on ngc_lightcone summaries
+sgc_lightcone: False # whether to train on sgc_lightcone summaries
+mtng_lightcone: False # whether to train on mtng_lightcone summaries
+
+
+Nmax: -1  # maximum number of simulations to use for training (-1 for all)
+val_frac: 0.1  # fraction of data to use for validation
+test_frac: 0.1  # fraction of data to use for testing
+seed: 0  # random seed for train/val/test split
+
+prior: Uniform  # prior to use for training (only uniform)
+
+backend: lampe # backend to use for training (sbi/lampe/pydelfi)
+engine: NPE    # engine to use for training (NPE/NLE/NRE)
+nets:
+  - model: nsf
+    hidden_features: 16
+    num_transforms: 4
+  - model: maf
+    hidden_features: 16
+    num_transforms: 4
+
+# fcn_hidden: [16, 16]  # hidden layer sizes for the FCN
+batch_size: 64  # batch size
+learning_rate: 5e-4  # learning rate
+
+device: cpu  # cpu or cuda
+
+exp_index: null  # index of experiment to run (null for all)
+
+experiments:
+  - summary: [Pk0, Qk0]   # monopole
+    kmax: [0.2]
