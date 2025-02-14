@@ -22,6 +22,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 #include <pybind11/numpy.h>
+#include <pybind11/functional.h>
 using namespace pybind11::literals;
 namespace pyb = pybind11;
 
@@ -40,6 +41,11 @@ namespace cmangle {
 #endif
 
 typedef uint64_t galid_t;  // Matt: I had to increase this from 32->64
+typedef uint64_t hloidx_t;
+
+typedef std::function<pyb::tuple(int, pyb::array_t<hloidx_t>, pyb::array_t<double>)> HOD_fct_t;
+
+static constexpr auto pyb_arr_style = pyb::array::c_style | pyb::array::forcecast;
 
 namespace Geometry
 {
@@ -157,7 +163,7 @@ struct Lightcone
     const Mask &mask;
     const double BoxSize, Omega_m, zmin, zmax;
     const int remap_case;
-    const bool correct, stitch_before_RSD, verbose;
+    const bool do_downsample, verbose;
     const unsigned augment;
     const unsigned long seed;
     const std::vector<double> snap_times;
@@ -166,19 +172,36 @@ struct Lightcone
     gsl_spline *z_chi_interp; std::vector<gsl_interp_accel *> z_chi_interp_acc;
     const cuboid::Cuboid C; const double Li[3]; // the sidelengths in decreasing order
     gsl_histogram *boss_z_hist;
-    std::vector<double> RA, DEC, Z;
-    std::vector<galid_t> GALID;
     std::vector<int> snap_indices_done;
 
-    Lightcone (const char *boss_dir_, const Mask &mask_, double Omega_m_, double zmin_, double zmax_,
+    // halo positions after remapping and redshift range cut, as well as IDs
+    // the CHI contains the velocity extrapolation correction
+    std::vector<double> tmp_hlo_CHI, tmp_hlo_V, tmp_hlo_Z;
+    std::vector<hloidx_t> tmp_hlo_ID;
+
+    // galaxy positions and IDs
+    std::vector<double> RA, DEC, Z;
+    std::vector<galid_t> GALID;
+
+    // the callback into python
+    // const HOD_fct_t hod_fct;
+    HOD_fct_t hod_fct;
+
+    Lightcone (const Mask &mask_,
+               // HOD_fct_t hod_fct_,
+               double Omega_m_, double zmin_, double zmax_,
                const std::vector<double> &snap_times_,
-               double BoxSize_=3e3, int remap_case_=0, bool correct_=true,
-               bool stitch_before_RSD_=true, bool verbose_=false, unsigned augment_=0,
+               const char *boss_dir_=nullptr, 
+               double BoxSize_=3e3, int remap_case_=0,
+               bool verbose_=false, unsigned augment_=0,
                unsigned long seed_=137UL) :
-        boss_dir{boss_dir_}, mask{mask_}, Omega_m{Omega_m_}, zmin{zmin_}, zmax{zmax_},
+        mask{mask_},
+        // hod_fct{hod_fct_},
+        Omega_m{Omega_m_}, zmin{zmin_}, zmax{zmax_},
         snap_times{snap_times_}, Nsnaps{snap_times_.size()},
-        BoxSize{BoxSize_}, remap_case{remap_case_}, correct{correct_},
-        stitch_before_RSD{stitch_before_RSD_}, verbose{verbose_}, augment{augment_},
+        boss_dir{boss_dir_}, do_downsample(boss_dir_),
+        BoxSize{BoxSize_}, remap_case{remap_case_},
+        verbose{verbose_}, augment{augment_},
         seed{seed_},
         C{cuboid::Cuboid(Geometry::remaps[remap_case_])}, Li{ C.L1, C.L2, C.L3}
     {
@@ -195,58 +218,78 @@ struct Lightcone
         interpolate_chi_z();
 
         // the target redshift distribution
-        if (verbose) std::printf("read_boss_nz\n");
-        read_boss_nz();
+        if (do_downsample)
+        {
+            if (verbose) std::printf("read_boss_nz\n");
+            read_boss_nz();
+        }
     }
+
+    void set_hod (HOD_fct_t hod_fct_) { hod_fct = hod_fct_; }
 
     ~Lightcone ()
     {
         gsl_spline_free(z_chi_interp);
         for (auto x: z_chi_interp_acc) gsl_interp_accel_free(x);
-        gsl_histogram_free(boss_z_hist);
+        if (boss_z_hist) gsl_histogram_free(boss_z_hist);
     }
 
-    void _add_snap (int snap_idx, size_t Ngal,
-                    std::vector<double> &xgal, std::vector<double> &vgal, std::vector<double> &vhlo)
+    void _add_snap (int snap_idx, size_t Nhlo,
+                    std::vector<double> &xhlo, std::vector<double> &vhlo)
     {
+        std::vector<double> delta_xgal, delta_vgal; std::vector<hloidx_t> hlo_idx;
+        size_t Ngal;
+
         if (std::find(snap_indices_done.begin(), snap_indices_done.end(), snap_idx)
             != snap_indices_done.end())
             throw std::runtime_error("adding the same snapshot twice");
 
+        if (verbose) std::printf("\tremap_snapshot\n");
+        remap_snapshot(Nhlo, xhlo, vhlo);
+
+        if (verbose) std::printf("\tchoose halos\n");
+        choose_halos(snap_idx, Nhlo, xhlo, vhlo);
+
+        // update the number of halos
+        Nhlo = tmp_hlo_ID.size();
+        if (!Nhlo) goto snap_done;
+
+        // callback into python to obtain the galaxy delta_x, delta_v, hlo_idx
+        if (verbose) std::printf("\tcallback into python HOD\n");
+        call_python_hod(snap_idx, Nhlo, hlo_idx, delta_xgal, delta_vgal);
+
+        Ngal = hlo_idx.size();
+        assert(3UL*Ngal==delta_xgal.size() && 3UL*Ngal==delta_vgal.size());
+        if (!Ngal) goto snap_done;
+
         if ( Ngal > (std::numeric_limits<galid_t>::max()/256) )
             throw std::runtime_error("too many galaxies");
 
-        if (verbose) std::printf("\tremap_snapshot\n");
-        remap_snapshot(Ngal, xgal, vgal, vhlo);
-
         if (verbose) std::printf("\tchoose_galaxies\n");
-        choose_galaxies(snap_idx, Ngal, xgal, vgal, vhlo);
+        choose_galaxies(snap_idx, Ngal, hlo_idx, delta_xgal, delta_vgal);
 
-        if (verbose) std::printf("Done with snap index %d\n", snap_idx);
-        snap_indices_done.push_back(snap_idx);
+        snap_done:
+            // clean up the temporary halo storage
+            tmp_hlo_CHI.clear(); tmp_hlo_V.clear(); tmp_hlo_Z.clear(); tmp_hlo_ID.clear();
+            if (verbose) std::printf("Done with snap index %d\n", snap_idx);
+            snap_indices_done.push_back(snap_idx);
     }
 
     void add_snap (int snap_idx,
-                   const pyb::array_t<double,
-                                      pyb::array::c_style | pyb::array::forcecast> &xgal_numpy,
-                   const pyb::array_t<double,
-                                      pyb::array::c_style | pyb::array::forcecast> &vgal_numpy,
-                   const pyb::array_t<double,
-                                      pyb::array::c_style | pyb::array::forcecast> &vhlo_numpy)
+                   const pyb::array_t<double, pyb_arr_style> &xhlo_numpy,
+                   const pyb::array_t<double, pyb_arr_style> &vhlo_numpy)
     {
-        size_t Ngal = xgal_numpy.shape()[0];
-        assert(xgal_numpy.shape()[1]==3 && vgal_numpy.shape()[1]==3
-               && (!correct || vhlo_numpy.shape()[1]==3));
-        assert(xgal_numpy.size()==3*Ngal && vgal_numpy.size()==3*Ngal
-               && (!correct || vhlo_numpy.size()==3*Ngal));
+        assert(xhlo_numpy.ndim()==2 && vhlo_numpy.ndim()==2);
+        size_t Nhlo = xhlo_numpy.shape(0);
+        assert(xhlo_numpy.shape(0)==Nhlo && vhlo_numpy.shape(0)==Nhlo);
+        assert(xhlo_numpy.shape(1)==3 && vhlo_numpy.shape(1)==3);
 
         // copy into vectors which we will modify
-        std::vector<double> xgal(3UL*Ngal), vgal(3UL*Ngal), vhlo((correct) ? 3UL*Ngal : 0);
-        std::memcpy(xgal.data(), xgal_numpy.data(), 3UL*Ngal*sizeof(double));
-        std::memcpy(vgal.data(), vgal_numpy.data(), 3UL*Ngal*sizeof(double));
-        if (correct) std::memcpy(vhlo.data(), vhlo_numpy.data(), 3UL*Ngal*sizeof(double));
+        std::vector<double> xhlo(3UL*Nhlo), vhlo(3UL*Nhlo);
+        std::memcpy(xhlo.data(), xhlo_numpy.data(), 3UL*Nhlo*sizeof(double));
+        std::memcpy(vhlo.data(), vhlo_numpy.data(), 3UL*Nhlo*sizeof(double));
 
-        _add_snap(snap_idx, Ngal, xgal, vgal, vhlo);
+        _add_snap(snap_idx, Nhlo, xhlo, vhlo);
     }
 
     void _finalize ()
@@ -254,22 +297,28 @@ struct Lightcone
         if (snap_indices_done.size() != Nsnaps)
             throw std::runtime_error("not all snapshots have been added");
 
-        // get an idea of the fiber collision rate in our sample,
-        // so the subsequent downsampling is to the correct level.
-        // This is justified as all this stuff is not super expensive.
-        double fibcoll_rate = fibcoll</*only_measure=*/true>();
+        if (do_downsample)
+        {
+            // get an idea of the fiber collision rate in our sample,
+            // so the subsequent downsampling is to the correct level.
+            // This is justified as all this stuff is not super expensive.
+            double fibcoll_rate = fibcoll</*only_measure=*/true>();
 
-        // first downsampling before fiber collisions are applied
-        if (verbose) std::printf("downsample\n");
-        downsample(fibcoll_rate+Numbers::fibcoll_rate_correction);
+            // first downsampling before fiber collisions are applied
+            if (verbose) std::printf("downsample\n");
+            downsample(fibcoll_rate+Numbers::fibcoll_rate_correction);
+        }
 
         // apply fiber collisions
         if (verbose) std::printf("fibcoll\n");
         fibcoll</*only_measure=*/false>(); 
 
         // now downsample to our final density
-        if (verbose) std::printf("downsample\n");
-        downsample(0.0);
+        if (do_downsample)
+        {
+            if (verbose) std::printf("downsample\n");
+            downsample(0.0);
+        }
     }
 
     pyb::tuple finalize ()
@@ -292,73 +341,42 @@ struct Lightcone
     template<bool> double fibcoll ();
     void remap_snapshot (size_t,
                          std::vector<double> &,
-                         std::vector<double> &,
                          std::vector<double> &) const;
+    void choose_halos (int, size_t,
+                       const std::vector<double> &,
+                       const std::vector<double> &);
+    void call_python_hod (int, size_t,
+                          std::vector<hloidx_t> &,
+                          std::vector<double> &,
+                          std::vector<double> &) const;
     void choose_galaxies (int, size_t,
-                          const std::vector<double> &,
+                          const std::vector<hloidx_t> &,
                           const std::vector<double> &,
                           const std::vector<double> &);
 };
 
-#ifdef TEST
-int main (int argc, char **argv)
-{
-    double Omega_m = 0.3;
-    const char *boss_dir = argv[1];
-    double zmin = std::atof(argv[2]);
-    double zmax = std::atof(argv[3]);
-    std::vector<double> snap_times;
-    for (char **c=argv+4; *c; ++c) snap_times.push_back(std::atof(*c));
-
-    std::printf("...Starting loading mask\n");
-    auto m = Mask(boss_dir);
-    std::printf("...finished loading mask, constructing lightcone...\n");
-    auto l = Lightcone(boss_dir, m, Omega_m, zmin, zmax, snap_times);
-    std::printf("...finished constructing lightcone, making galaxies...\n");
-    
-    std::vector<double> xa, va, vha;
-    const size_t N = 128;
-    gsl_rng *rng = gsl_rng_alloc(gsl_rng_default);
-    gsl_rng_set(rng, 42);
-    for (size_t ii=0; ii<N*3UL; ++ii)
-    {
-        xa.push_back(gsl_rng_uniform(rng) * 3e3);
-        va.push_back((gsl_rng_uniform(rng)-0.5) * 200.0);
-        vha.push_back((gsl_rng_uniform(rng)-0.5) * 200.0);
-    }
-    gsl_rng_free(rng);
-    std::printf("...finished making galaxies, adding snapshot...\n");
-
-    l._add_snap(0, N, xa, va, vha);
-    std::printf("...finished adding snapshot, finalizing...\n");
-
-    l._finalize();
-    std::printf("...done!\n");
-
-    return 0;
-}
-#else // TEST
 PYBIND11_MODULE(lc, m)
 {
     pyb::class_<Mask> (m, "Mask")
         .def(pyb::init<const char *, bool>(), "boss_dir"_a, pyb::kw_only(), "veto"_a=true);
 
     pyb::class_<Lightcone> (m, "Lightcone")
-        .def(pyb::init<const char *, const Mask&, double, double, double,
-                       const std::vector<double>&,
-                       double, int, bool,
-                       bool, bool, unsigned,
+        .def(pyb::init<const Mask&, double, double, double, const std::vector<double>&,
+                       const char *,
+                       double, int,
+                       bool, unsigned,
                        unsigned long>(),
-            "boss_dir"_a, "mask"_a, "Omega_m"_a, "zmin"_a, "zmax"_a, "snap_times"_a,
+            "mask"_a, "Omega_m"_a, "zmin"_a, "zmax"_a, "snap_times"_a,
             pyb::kw_only(),
-            "BoxSize"_a=3e3, "remap_case"_a=0, "correct"_a=true,
-            "stitch_before_RSD"_a=true, "verbose"_a=false, "augment"_a=0,
+            "boss_dir"_a=nullptr,
+            "BoxSize"_a=3e3, "remap_case"_a=0,
+            "verbose"_a=false, "augment"_a=0,
             "seed"_a=137UL
         )
-        .def("add_snap", &Lightcone::add_snap, "snap_idx"_a, "xgal"_a, "vgal"_a, "vhlo"_a)
+        .def("set_hod", &Lightcone::set_hod, "hod_fct"_a)
+        .def("add_snap", &Lightcone::add_snap, "snap_idx"_a, "xhlo"_a, "vhlo"_a)
         .def("finalize", &Lightcone::finalize);
 }
-#endif // TEST
 
 void Lightcone::read_boss_nz (void)
 {
@@ -451,7 +469,7 @@ static inline double per_unit (T x, double BoxSize)
     return (x1<0.0) ? x1+1.0 : x1;
 }
 
-static inline void reflect (unsigned r, double *x, double *v, double *vh,
+static inline void reflect (unsigned r, double *x, double *v,
                             double BoxSize)
 {
     for (unsigned ii=0; ii<3; ++ii)
@@ -459,7 +477,6 @@ static inline void reflect (unsigned r, double *x, double *v, double *vh,
         {
             x[ii] = BoxSize - x[ii];
             v[ii] *= -1.0;
-            if (vh) vh[ii] *= -1.0;
         }
 }
 
@@ -479,50 +496,38 @@ static inline void transpose (unsigned t, double *x)
     }
 }
 
-void Lightcone::remap_snapshot (size_t Ngal,
-                                std::vector<double> &xgal,
-                                std::vector<double> &vgal,
+void Lightcone::remap_snapshot (size_t Nhlo,
+                                std::vector<double> &xhlo,
                                 std::vector<double> &vhlo) const
 {
-    std::vector<double> tmp_xgal, tmp_vgal, tmp_vhlo;
-    tmp_xgal.resize(3*Ngal); tmp_vgal.resize(3*Ngal);
-    if (correct) tmp_vhlo.resize(3*Ngal);
+    std::vector<double> tmp_xhlo(3UL*Nhlo), tmp_vhlo(3UL*Nhlo);
 
     unsigned r = augment / 6; // labels the 8 reflection cases
     unsigned t = augment % 6; // labels the 6 transposition cases
 
     #pragma omp parallel for schedule (dynamic, 1024)
-    for (size_t ii=0; ii<Ngal; ++ii)
+    for (size_t ii=0; ii<Nhlo; ++ii)
     {
-        double x[3], v[3], vh[3];
+        double x[3], v[3];
         for (int kk=0; kk<3; ++kk)
         {
-            x[kk] = xgal[3*ii+kk];
-            v[kk] = vgal[3*ii+kk];
-            if (correct) vh[kk] = vhlo[3*ii+kk];
+            x[kk] = xhlo[3*ii+kk];
+            v[kk] = vhlo[3*ii+kk];
         }
 
-        reflect(r, x, v, (correct)? vh : nullptr, BoxSize);
+        reflect(r, x, v, BoxSize);
 
         transpose(t, x);
         C.Transform(per_unit(x[0], BoxSize), per_unit(x[1], BoxSize), per_unit(x[2], BoxSize),
-                    tmp_xgal[3*ii+0], tmp_xgal[3*ii+1], tmp_xgal[3*ii+2]);
-        for (int kk=0; kk<3; ++kk) tmp_xgal[3*ii+kk] *= BoxSize;
+                    tmp_xhlo[3*ii+0], tmp_xhlo[3*ii+1], tmp_xhlo[3*ii+2]);
+        for (int kk=0; kk<3; ++kk) tmp_xhlo[3*ii+kk] *= BoxSize;
 
         transpose(t, v);
         C.VelocityTransform(v[0], v[1], v[2],
-                            tmp_vgal[3*ii+0], tmp_vgal[3*ii+1], tmp_vgal[3*ii+2]);
-
-        if (correct)
-        {
-            transpose(t, vh);
-            C.VelocityTransform(vh[0], vh[1], vh[2],
-                                tmp_vhlo[3*ii+0], tmp_vhlo[3*ii+1], tmp_vhlo[3*ii+2]);
-        }
+                            tmp_vhlo[3*ii+0], tmp_vhlo[3*ii+1], tmp_vhlo[3*ii+2]);
     }
 
-    xgal = std::move(tmp_xgal);
-    vgal = std::move(tmp_vgal);
+    xhlo = std::move(tmp_xhlo);
     vhlo = std::move(tmp_vhlo);
 }
 
@@ -531,10 +536,63 @@ static inline galid_t make_galid (galid_t snap_idx, galid_t gal_idx)
     return ( snap_idx << ((sizeof(galid_t)-1)*CHAR_BIT) ) + gal_idx;
 }
 
+void Lightcone::choose_halos (int snap_idx, size_t Nhlo,
+                              const std::vector<double> &xhlo,
+                              const std::vector<double> &vhlo)
+{
+    assert(tmp_hlo_CHI.empty() && tmp_hlo_V.empty() && tmp_hlo_Z.empty() && tmp_hlo_ID.empty());
+
+    // h km/s/Mpc
+    const double H_ = Hz(snap_redshifts[snap_idx], Omega_m);
+
+    #pragma omp parallel
+    {
+        // the accelerator is non-const upon evaluation
+        auto acc = z_chi_interp_acc[omp_get_thread_num()];
+        double los[3];
+
+        #pragma omp for schedule (dynamic, 1024)
+        for (size_t jj=0; jj<Nhlo; ++jj)
+        {
+            for (int kk=0; kk<3; ++kk) los[kk] = xhlo[3*jj+kk] - Geometry::origin[kk]*BoxSize*Li[kk];
+            double chi = std::hypot(los[0], los[1], los[2]);
+
+            double vhloproj = (los[0]*vhlo[3*jj+0]+los[1]*vhlo[3*jj+1]+los[2]*vhlo[3*jj+2])
+                              / chi;
+
+            // map onto the lightcone -- we assume that this is a relatively small correction
+            //                           so we just do it to first order
+            double delta_z = (chi - snap_chis[snap_idx])
+                             / (Numbers::lightspeed + vhloproj) * H_;
+
+            // correct the position accordingly
+            for (int kk=0; kk<3; ++kk) los[kk] -= delta_z * vhlo[3*jj+kk] / H_;
+
+            // only a small correction I assume (and it is borne out by experiment!)
+            chi = std::hypot(los[0], los[1], los[2]);
+
+            if (chi>chi_bounds[snap_idx] && chi<chi_bounds[snap_idx+1])
+            // we are in the comoving shell that's coming from this snapshot
+            // since we're doing halos here, no testing for mask
+            {
+                double z = gsl_spline_eval(z_chi_interp, chi, acc);
+
+                #pragma omp critical (HLO_CHOOSE_APPEND)
+                {
+                    for (int kk=0; kk<3; ++kk) tmp_hlo_CHI.push_back(los[kk]);
+                    for (int kk=0; kk<3; ++kk) tmp_hlo_V.push_back(vhlo[3*jj+kk]);
+                    tmp_hlo_Z.push_back(z);
+                    tmp_hlo_ID.push_back(jj);
+                }
+            }
+        }
+    }
+}
+
 void Lightcone::choose_galaxies (int snap_idx, size_t Ngal,
-                                 const std::vector<double> &xgal,
-                                 const std::vector<double> &vgal,
-                                 const std::vector<double> &vhlo)
+                                 const std::vector<hloidx_t> &hlo_idx,
+                                 const std::vector<double> &delta_xgal,
+                                 const std::vector<double> &delta_vgal)
 {
     // h km/s/Mpc
     const double H_ = Hz(snap_redshifts[snap_idx], Omega_m);
@@ -548,7 +606,7 @@ void Lightcone::choose_galaxies (int snap_idx, size_t Ngal,
     {
         // the accelerator is non-const upon evaluation
         auto acc = z_chi_interp_acc[omp_get_thread_num()];
-        double los[3];
+        double los[3], vgal[3];
         int mangle_status_ = 1;
 
         #pragma omp for schedule (dynamic, 1024)
@@ -556,33 +614,15 @@ void Lightcone::choose_galaxies (int snap_idx, size_t Ngal,
         {
             if (!mangle_status_) [[unlikely]] continue;
 
-            for (int kk=0; kk<3; ++kk) los[kk] = xgal[3*jj+kk] - Geometry::origin[kk]*BoxSize*Li[kk];
+            assert(hlo_idx[jj]<tmp_hlo_ID.size());
+
+            for (int kk=0; kk<3; ++kk) los[kk] = tmp_hlo_CHI[3*hlo_idx[jj]+kk] + delta_xgal[3*jj+kk];
             double chi = std::hypot(los[0], los[1], los[2]);
 
-            if (correct)
-            {
-                double vhloproj = (los[0]*vhlo[3*jj+0]+los[1]*vhlo[3*jj+1]+los[2]*vhlo[3*jj+2])
-                                  / chi;
-
-                // map onto the lightcone -- we assume that this is a relatively small correction
-                //                           so we just do it to first order
-                double delta_z = (chi - snap_chis[snap_idx])
-                                 / (Numbers::lightspeed + vhloproj) * H_;
-
-                // correct the position accordingly
-                for (int kk=0; kk<3; ++kk) los[kk] -= delta_z * vhlo[3*jj+kk] / H_;
-
-                // only a small correction I assume (and it is borne out by experiment!)
-                chi = std::hypot(los[0], los[1], los[2]);
-            }
-
-            double chi_stitch; // the one used for stitching
-
-            if (stitch_before_RSD) chi_stitch = chi;
+            for (int kk=0; kk<3; ++kk) vgal[kk] = tmp_hlo_V[3*hlo_idx[jj]+kk] + delta_vgal[3*jj+kk];
 
             // the radial velocity
-            double vproj = (los[0]*vgal[3*jj+0]+los[1]*vgal[3*jj+1]+los[2]*vgal[3*jj+2])
-                           / chi;
+            double vproj = (los[0]*vgal[0]+los[1]*vgal[1]+los[2]*vgal[2]) / chi;
 
             // now add RSD (the order is important here, as RSD can be a pretty severe effect)
             for (int kk=0; kk<3; ++kk) los[kk] += rsd_factor * vproj * los[kk] / chi;
@@ -590,13 +630,8 @@ void Lightcone::choose_galaxies (int snap_idx, size_t Ngal,
             // I'm lazy
             chi = std::hypot(los[0], los[1], los[2]);
 
-            if (!stitch_before_RSD) chi_stitch = chi;
-
-            if (chi_stitch>chi_bounds[snap_idx] && chi_stitch<chi_bounds[snap_idx+1]
-                // prevent from falling out of the redshift interval we're mapping into
-                // (only relevent if stitching based on chi before RSD)
-                && (!stitch_before_RSD || (chi>chi_bounds[0] && chi<chi_bounds[Nsnaps])))
-            // we are in the comoving shell that's coming from this snapshot
+            // discard galaxies falling out at the edges
+            if (chi>chi_bounds[0] && chi<chi_bounds[Nsnaps]) [[likely]]
             {
                 // rotate the line of sight into the NGC footprint and transpose the axes into
                 // canonical order
@@ -643,6 +678,37 @@ void Lightcone::choose_galaxies (int snap_idx, size_t Ngal,
     }
 
     if (!mangle_status) throw std::runtime_error("mangle failed");
+}
+
+void Lightcone::call_python_hod (int snap_idx, size_t Nhlo,
+                                 std::vector<hloidx_t> &hlo_idx,
+                                 std::vector<double> &delta_xgal,
+                                 std::vector<double> &delta_vgal) const
+{
+    assert( hlo_idx.empty() && delta_xgal.empty() && delta_vgal.empty() );
+
+    pyb::array_t<double> hlo_Z_numpy = pyb::array(Nhlo, tmp_hlo_Z.data());
+    pyb::array_t<hloidx_t> hlo_ID_numpy = pyb::array(Nhlo, tmp_hlo_ID.data());
+
+    // here we give control back to python
+    pyb::tuple res = hod_fct(snap_idx, hlo_ID_numpy, hlo_Z_numpy);
+    assert(res.size() == 3);
+
+    pyb::array_t<hloidx_t> hlo_idx_numpy = res[0].cast<pyb::array_t<hloidx_t, pyb_arr_style>>();
+    pyb::array_t<double> delta_xgal_numpy = res[1].cast<pyb::array_t<double, pyb_arr_style>>();
+    pyb::array_t<double> delta_vgal_numpy = res[2].cast<pyb::array_t<double, pyb_arr_style>>();
+
+    // make sure what we got makes sense
+    assert(hlo_idx_numpy.ndim()==1 && delta_xgal_numpy.ndim()==2 && delta_vgal_numpy.ndim()==2);
+    size_t Ngal = hlo_idx_numpy.shape(0);
+    assert(delta_xgal_numpy.shape(0)==Ngal && delta_xgal_numpy.shape(1)==3);
+    assert(delta_vgal_numpy.shape(0)==Ngal && delta_vgal_numpy.shape(1)==3);
+
+    // copy into our nice internal arrays
+    hlo_idx.resize(Ngal); delta_xgal.resize(3UL*Ngal); delta_vgal.resize(3UL*Ngal);
+    std::memcpy(hlo_idx.data(), hlo_idx_numpy.data(), Ngal*sizeof(hloidx_t));
+    std::memcpy(delta_xgal.data(), delta_xgal_numpy.data(), 3UL*Ngal*sizeof(double));
+    std::memcpy(delta_vgal.data(), delta_vgal_numpy.data(), 3UL*Ngal*sizeof(double));
 }
 
 void Lightcone::downsample (double plus_factor)

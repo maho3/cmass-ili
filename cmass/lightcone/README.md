@@ -25,6 +25,13 @@ and can then be passed to the lightcone generator repeatedly.
 ## lightcone Constructor
 
 **Mandatory**
+* `mask`: instance of the `Mask` class, constructed as described above
+* `Omega_m`
+* `zmin`, `zmax`: the redshift boundaries
+* `snap_times`: a monotonically *decreasing* list of scale factors
+  (i.e., increasing redshift)
+
+**Optional**
 * `boss_dir`: a directory containing a text file named
   `nz_DR12v5_CMASS_North_zmin%.4f_zmax%.4f.dat`,
   where the placeholders are filled by the `zmin` and `zmax` arguments.
@@ -33,19 +40,9 @@ and can then be passed to the lightcone generator repeatedly.
   between `zmin` and `zmax`.
   Each line of the file should contain a single integer for the number
   of galaxies in the corresponding bin.
-* `mask`: instance of the `Mask` class, constructed as described above
-* `Omega_m`
-* `zmin`, `zmax`: the redshift boundaries
-* `snap_times`: a monotonically *decreasing* list of scale factors
-  (i.e., increasing redshift)
-
-**Optional**
+  Set this to `None` to skip downsampling to any redshift distribution.
 * `BoxSize = 3e3`: Mpc/h
 * `remap_case = 0`: either 0 or 1
-* `correct = True`: whether extrapolation dependent on host halo velocity is performed
-* `stitch_before_RSD = True`: I wasn't able to figure out whether real or redshift space
-  galaxy positions are appropriate when deciding how to stitch the snapshots.
-  It probably doesn't matter much but can be played with.
 * `verbose = False`
 * `augment = 0`: between 0 and 47. There are 96 possible augmentations implemented,
   namely the product of 2 remaps (above argument), 8 reflections, 6 transpositions.
@@ -53,6 +50,37 @@ and can then be passed to the lightcone generator repeatedly.
   is important.
 * `seed = 137`: randomness is introduced in downsampling to n(z) and fiber collisions.
   I believe determinism will only be possible when running on a single thread.
+
+## setting the HOD
+
+It is somehow hard to do this in the constructor, some pybind11 issue.
+Hacky solution is just a separate method, `set_hod` which just takes a python callable.
+I have some example in `example.py`, here I copy the documentation:
+```python
+def hod_fct (
+        snap_idx: int,
+        hlo_idx: np.ndarray[np.uint64],
+        z: np.ndarray[np.float64]) -> tuple :
+    """ This is the callback function for the HOD
+
+    The arguments are
+    - snap_idx: an integer going into the snapshots list
+    - hlo_idx: an array of integer indices going into the halo arrays
+    - z: an array of doubles corresponding to the redshifts at which halos intersect lightcone
+
+    This function is expected to return the following:
+    - hlo_idx: a [N] array of integer indices going into the arrays *passed as inputs to this function*
+               So these *do not* correspond to the halo indices that came as inputs!
+    - delta_x: a [N,3] array of galaxy position offsets from their host halo centers,
+               comoving Mpc/h
+    - delta_v: a [N,3] array of galaxy velocity offsets from their host halo velocities,
+               physical km/s
+
+    NOTE that this can be any callable as usual,
+         so you can use any object as long as it implements the __call__ method
+    """
+```
+
 
 
 ## adding galaxies
